@@ -15,8 +15,35 @@ var _ = json.Marshal
 // Example:
 // - 5:hello -> hello
 // - 10:hello12345 -> hello12345
+// - i52e -> 52
+// - i-52e -> -52
 func decodeBencode(bencodedString string) (interface{}, error) {
-	if unicode.IsDigit(rune(bencodedString[0])) {
+	if len(bencodedString) == 0 {
+		return "", fmt.Errorf("Empty bencoded string")
+	}
+
+	if bencodedString[0] == 'i' {
+		// Integer: i<number>e
+		var endIndex int = -1
+		for i := 1; i < len(bencodedString); i++ {
+			if bencodedString[i] == 'e' {
+				endIndex = i
+				break
+			}
+		}
+		if endIndex == -1 {
+			return "", fmt.Errorf("Integer not properly terminated with 'e'")
+		}
+
+		numberStr := bencodedString[1:endIndex]
+		number, err := strconv.Atoi(numberStr)
+		if err != nil {
+			return "", fmt.Errorf("Invalid integer: %v", err)
+		}
+
+		return number, nil
+	} else if unicode.IsDigit(rune(bencodedString[0])) {
+		// String: <length>:<string>
 		var firstColonIndex int
 
 		for i := 0; i < len(bencodedString); i++ {
@@ -35,7 +62,7 @@ func decodeBencode(bencodedString string) (interface{}, error) {
 
 		return bencodedString[firstColonIndex+1 : firstColonIndex+1+length], nil
 	} else {
-		return "", fmt.Errorf("Only strings are supported at the moment")
+		return "", fmt.Errorf("Unsupported bencode type")
 	}
 }
 
