@@ -58,6 +58,41 @@ func decodeBencodeWithPos(bencodedString string, pos int) (interface{}, int, err
 		}
 
 		return list, pos + 1, nil // +1 to skip 'e'
+	} else if bencodedString[pos] == 'd' {
+		// Dictionary: d<key1><value1>...<keyN><valueN>e
+		pos++ // skip 'd'
+		dict := make(map[string]interface{})
+
+		for pos < len(bencodedString) && bencodedString[pos] != 'e' {
+			// Decode key (must be a string)
+			key, newPos, err := decodeBencodeWithPos(bencodedString, pos)
+			if err != nil {
+				return nil, pos, err
+			}
+
+			// Verify key is a string
+			keyStr, ok := key.(string)
+			if !ok {
+				return nil, pos, fmt.Errorf("Dictionary key must be a string")
+			}
+
+			pos = newPos
+
+			// Decode value
+			value, newPos, err := decodeBencodeWithPos(bencodedString, pos)
+			if err != nil {
+				return nil, pos, err
+			}
+
+			dict[keyStr] = value
+			pos = newPos
+		}
+
+		if pos >= len(bencodedString) {
+			return nil, pos, fmt.Errorf("Dictionary not properly terminated with 'e'")
+		}
+
+		return dict, pos + 1, nil // +1 to skip 'e'
 	} else if unicode.IsDigit(rune(bencodedString[pos])) {
 		// String: <length>:<string>
 		var firstColonIndex int
@@ -97,6 +132,7 @@ func decodeBencodeWithPos(bencodedString string, pos int) (interface{}, int, err
 // - i52e -> 52
 // - i-52e -> -52
 // - l5:helloi52ee -> ["hello", 52]
+// - d3:foo3:bar5:helloi52ee -> {"foo":"bar","hello":52}
 func decodeBencode(bencodedString string) (interface{}, error) {
 	if len(bencodedString) == 0 {
 		return "", fmt.Errorf("Empty bencoded string")
