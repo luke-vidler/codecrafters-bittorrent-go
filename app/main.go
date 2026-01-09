@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -150,6 +151,60 @@ func decodeBencode(bencodedString string) (interface{}, error) {
 	return value, nil
 }
 
+// findInfoDictionaryBytes finds the "info" key in the bencoded dictionary and returns
+// the exact bytes of the info dictionary value
+func findInfoDictionaryBytes(fileData []byte) ([]byte, error) {
+	bencodedString := string(fileData)
+	pos := 0
+
+	// Must start with 'd'
+	if pos >= len(bencodedString) || bencodedString[pos] != 'd' {
+		return nil, fmt.Errorf("Expected dictionary at start")
+	}
+	pos++ // skip 'd'
+
+	// Parse through dictionary keys to find "info"
+	for pos < len(bencodedString) && bencodedString[pos] != 'e' {
+		// Decode key
+		key, newPos, err := decodeBencodeWithPos(bencodedString, pos)
+		if err != nil {
+			return nil, err
+		}
+
+		keyStr, ok := key.(string)
+		if !ok {
+			return nil, fmt.Errorf("Dictionary key must be a string")
+		}
+
+		pos = newPos
+
+		// If this is the "info" key, extract the value bytes
+		if keyStr == "info" {
+			// The value starts at pos
+			valueStart := pos
+
+			// We need to find where this value ends
+			// Since it's a dictionary, we need to parse it to find the matching 'e'
+			_, valueEnd, err := decodeBencodeWithPos(bencodedString, pos)
+			if err != nil {
+				return nil, err
+			}
+
+			// Extract the bytes (convert back to byte slice indices)
+			return fileData[valueStart:valueEnd], nil
+		}
+
+		// Skip the value to get to the next key
+		_, newPos, err = decodeBencodeWithPos(bencodedString, pos)
+		if err != nil {
+			return nil, err
+		}
+		pos = newPos
+	}
+
+	return nil, fmt.Errorf("'info' key not found in dictionary")
+}
+
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
@@ -231,9 +286,21 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Extract the info dictionary bytes for hashing
+		infoBytes, err := findInfoDictionaryBytes(fileData)
+		if err != nil {
+			fmt.Printf("Error extracting info dictionary: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Calculate SHA-1 hash
+		hash := sha1.Sum(infoBytes)
+		infoHash := fmt.Sprintf("%x", hash)
+
 		// Print the information
 		fmt.Printf("Tracker URL: %s\n", announceStr)
 		fmt.Printf("Length: %d\n", lengthInt)
+		fmt.Printf("Info Hash: %s\n", infoHash)
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
