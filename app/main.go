@@ -12,58 +12,106 @@ import (
 // Ensures gofmt doesn't remove the "os" encoding/json import (feel free to remove this!)
 var _ = json.Marshal
 
-// Example:
-// - 5:hello -> hello
-// - 10:hello12345 -> hello12345
-// - i52e -> 52
-// - i-52e -> -52
-func decodeBencode(bencodedString string) (interface{}, error) {
-	if len(bencodedString) == 0 {
-		return "", fmt.Errorf("Empty bencoded string")
+// decodeBencodeWithPos decodes a bencoded value starting at the given position
+// Returns the decoded value and the new position after consuming the value
+func decodeBencodeWithPos(bencodedString string, pos int) (interface{}, int, error) {
+	if pos >= len(bencodedString) {
+		return nil, pos, fmt.Errorf("Unexpected end of input")
 	}
 
-	if bencodedString[0] == 'i' {
+	if bencodedString[pos] == 'i' {
 		// Integer: i<number>e
 		var endIndex int = -1
-		for i := 1; i < len(bencodedString); i++ {
+		for i := pos + 1; i < len(bencodedString); i++ {
 			if bencodedString[i] == 'e' {
 				endIndex = i
 				break
 			}
 		}
 		if endIndex == -1 {
-			return "", fmt.Errorf("Integer not properly terminated with 'e'")
+			return nil, pos, fmt.Errorf("Integer not properly terminated with 'e'")
 		}
 
-		numberStr := bencodedString[1:endIndex]
+		numberStr := bencodedString[pos+1 : endIndex]
 		number, err := strconv.Atoi(numberStr)
 		if err != nil {
-			return "", fmt.Errorf("Invalid integer: %v", err)
+			return nil, pos, fmt.Errorf("Invalid integer: %v", err)
 		}
 
-		return number, nil
-	} else if unicode.IsDigit(rune(bencodedString[0])) {
+		return number, endIndex + 1, nil
+	} else if bencodedString[pos] == 'l' {
+		// List: l<elements>e
+		pos++ // skip 'l'
+		list := []interface{}{}
+
+		for pos < len(bencodedString) && bencodedString[pos] != 'e' {
+			value, newPos, err := decodeBencodeWithPos(bencodedString, pos)
+			if err != nil {
+				return nil, pos, err
+			}
+			list = append(list, value)
+			pos = newPos
+		}
+
+		if pos >= len(bencodedString) {
+			return nil, pos, fmt.Errorf("List not properly terminated with 'e'")
+		}
+
+		return list, pos + 1, nil // +1 to skip 'e'
+	} else if unicode.IsDigit(rune(bencodedString[pos])) {
 		// String: <length>:<string>
 		var firstColonIndex int
 
-		for i := 0; i < len(bencodedString); i++ {
+		for i := pos; i < len(bencodedString); i++ {
 			if bencodedString[i] == ':' {
 				firstColonIndex = i
 				break
 			}
 		}
 
-		lengthStr := bencodedString[:firstColonIndex]
+		if firstColonIndex == 0 {
+			return nil, pos, fmt.Errorf("String format error: no colon found")
+		}
+
+		lengthStr := bencodedString[pos:firstColonIndex]
 
 		length, err := strconv.Atoi(lengthStr)
 		if err != nil {
-			return "", err
+			return nil, pos, err
 		}
 
-		return bencodedString[firstColonIndex+1 : firstColonIndex+1+length], nil
+		if firstColonIndex+1+length > len(bencodedString) {
+			return nil, pos, fmt.Errorf("String length exceeds remaining input")
+		}
+
+		str := bencodedString[firstColonIndex+1 : firstColonIndex+1+length]
+		return str, firstColonIndex + 1 + length, nil
 	} else {
-		return "", fmt.Errorf("Unsupported bencode type")
+		return nil, pos, fmt.Errorf("Unsupported bencode type: %c", bencodedString[pos])
 	}
+}
+
+// Example:
+// - 5:hello -> hello
+// - 10:hello12345 -> hello12345
+// - i52e -> 52
+// - i-52e -> -52
+// - l5:helloi52ee -> ["hello", 52]
+func decodeBencode(bencodedString string) (interface{}, error) {
+	if len(bencodedString) == 0 {
+		return "", fmt.Errorf("Empty bencoded string")
+	}
+
+	value, pos, err := decodeBencodeWithPos(bencodedString, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	if pos != len(bencodedString) {
+		return nil, fmt.Errorf("Unexpected trailing data")
+	}
+
+	return value, nil
 }
 
 func main() {
