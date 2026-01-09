@@ -1,14 +1,17 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"unicode"
 	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
@@ -517,6 +520,85 @@ func main() {
 			port := binary.BigEndian.Uint16(peerBytes[4:6])
 			fmt.Printf("%s:%d\n", ip, port)
 		}
+	} else if command == "handshake" {
+		filename := os.Args[2]
+		peerAddress := os.Args[3] // format: "IP:port"
+
+		// Parse peer address
+		parts := strings.Split(peerAddress, ":")
+		if len(parts) != 2 {
+			fmt.Printf("Error: invalid peer address format. Expected IP:port, got: %s\n", peerAddress)
+			os.Exit(1)
+		}
+		peerIP := parts[0]
+		peerPort := parts[1]
+
+		// Read the torrent file
+		fileData, err := os.ReadFile(filename)
+		if err != nil {
+			fmt.Printf("Error reading file: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Extract the info dictionary bytes for hashing
+		infoBytes, err := findInfoDictionaryBytes(fileData)
+		if err != nil {
+			fmt.Printf("Error extracting info dictionary: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Calculate SHA-1 hash (20 bytes)
+		hash := sha1.Sum(infoBytes)
+		infoHashBytes := hash[:]
+
+		// Generate random peer_id (20 bytes)
+		peerID := make([]byte, 20)
+		_, err = rand.Read(peerID)
+		if err != nil {
+			fmt.Printf("Error generating peer ID: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Build handshake message
+		handshake := make([]byte, 0, 68) // 1 + 19 + 8 + 20 + 20 = 68 bytes
+		handshake = append(handshake, 19) // protocol string length
+		handshake = append(handshake, []byte("BitTorrent protocol")...)
+		handshake = append(handshake, make([]byte, 8)...) // 8 reserved bytes (all zeros)
+		handshake = append(handshake, infoHashBytes...)
+		handshake = append(handshake, peerID...)
+
+		// Establish TCP connection
+		conn, err := net.Dial("tcp", peerIP+":"+peerPort)
+		if err != nil {
+			fmt.Printf("Error connecting to peer: %v\n", err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+
+		// Send handshake
+		_, err = conn.Write(handshake)
+		if err != nil {
+			fmt.Printf("Error sending handshake: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Receive handshake response (68 bytes: 1 + 19 + 8 + 20 + 20)
+		response := make([]byte, 68)
+		totalRead := 0
+		for totalRead < 68 {
+			n, err := conn.Read(response[totalRead:])
+			if err != nil {
+				fmt.Printf("Error receiving handshake: %v\n", err)
+				os.Exit(1)
+			}
+			totalRead += n
+		}
+
+		// Extract peer ID from response (bytes 48-67, which is the last 20 bytes)
+		receivedPeerID := response[48:68]
+
+		// Print peer ID in hexadecimal
+		fmt.Printf("Peer ID: %x\n", receivedPeerID)
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
