@@ -168,6 +168,72 @@ func main() {
 
 		jsonOutput, _ := json.Marshal(decoded)
 		fmt.Println(string(jsonOutput))
+	} else if command == "info" {
+		filename := os.Args[2]
+
+		// Read the torrent file as bytes (it may contain binary data)
+		fileData, err := os.ReadFile(filename)
+		if err != nil {
+			fmt.Printf("Error reading file: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Convert bytes to string (Go strings can contain arbitrary bytes)
+		bencodedString := string(fileData)
+
+		// Decode the bencoded dictionary
+		decoded, err := decodeBencode(bencodedString)
+		if err != nil {
+			fmt.Printf("Error decoding bencode: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Cast to map[string]interface{}
+		torrentDict, ok := decoded.(map[string]interface{})
+		if !ok {
+			fmt.Println("Error: torrent file does not contain a dictionary")
+			os.Exit(1)
+		}
+
+		// Extract announce (tracker URL)
+		announce, ok := torrentDict["announce"]
+		if !ok {
+			fmt.Println("Error: torrent file missing 'announce' field")
+			os.Exit(1)
+		}
+		announceStr, ok := announce.(string)
+		if !ok {
+			fmt.Println("Error: 'announce' field is not a string")
+			os.Exit(1)
+		}
+
+		// Extract info dictionary
+		info, ok := torrentDict["info"]
+		if !ok {
+			fmt.Println("Error: torrent file missing 'info' field")
+			os.Exit(1)
+		}
+		infoDict, ok := info.(map[string]interface{})
+		if !ok {
+			fmt.Println("Error: 'info' field is not a dictionary")
+			os.Exit(1)
+		}
+
+		// Extract length from info
+		length, ok := infoDict["length"]
+		if !ok {
+			fmt.Println("Error: 'info' dictionary missing 'length' field")
+			os.Exit(1)
+		}
+		lengthInt, ok := length.(int)
+		if !ok {
+			fmt.Println("Error: 'length' field is not an integer")
+			os.Exit(1)
+		}
+
+		// Print the information
+		fmt.Printf("Tracker URL: %s\n", announceStr)
+		fmt.Printf("Length: %d\n", lengthInt)
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
