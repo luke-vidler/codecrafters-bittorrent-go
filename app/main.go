@@ -47,17 +47,16 @@ func main() {
 
 	if command == "decode" {
 		// TODO: Uncomment the code below to pass the first stage
-		//
-		// bencodedValue := os.Args[2]
-		//
-		// decoded, err := decodeBencode(bencodedValue)
-		// if err != nil {
-		// 	fmt.Println(err)
-		// 	return
-		// }
-		//
-		// jsonOutput, _ := json.Marshal(decoded)
-		// fmt.Println(string(jsonOutput))
+		bencodedValue := os.Args[2]
+
+		decoded, err := decodeBencode(bencodedValue)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		jsonOutput, _ := json.Marshal(decoded)
+		fmt.Println(string(jsonOutput))
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
