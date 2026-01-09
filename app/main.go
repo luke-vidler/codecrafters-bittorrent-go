@@ -297,10 +297,47 @@ func main() {
 		hash := sha1.Sum(infoBytes)
 		infoHash := fmt.Sprintf("%x", hash)
 
+		// Extract piece length from info
+		pieceLength, ok := infoDict["piece length"]
+		if !ok {
+			fmt.Println("Error: 'info' dictionary missing 'piece length' field")
+			os.Exit(1)
+		}
+		pieceLengthInt, ok := pieceLength.(int)
+		if !ok {
+			fmt.Println("Error: 'piece length' field is not an integer")
+			os.Exit(1)
+		}
+
+		// Extract pieces from info
+		pieces, ok := infoDict["pieces"]
+		if !ok {
+			fmt.Println("Error: 'info' dictionary missing 'pieces' field")
+			os.Exit(1)
+		}
+		piecesStr, ok := pieces.(string)
+		if !ok {
+			fmt.Println("Error: 'pieces' field is not a string")
+			os.Exit(1)
+		}
+
+		// Convert pieces string to bytes and split into 20-byte chunks
+		piecesBytes := []byte(piecesStr)
+		if len(piecesBytes)%20 != 0 {
+			fmt.Printf("Error: 'pieces' length (%d) is not a multiple of 20\n", len(piecesBytes))
+			os.Exit(1)
+		}
+
 		// Print the information
 		fmt.Printf("Tracker URL: %s\n", announceStr)
 		fmt.Printf("Length: %d\n", lengthInt)
 		fmt.Printf("Info Hash: %s\n", infoHash)
+		fmt.Printf("Piece Length: %d\n", pieceLengthInt)
+		fmt.Println("Piece Hashes:")
+		for i := 0; i < len(piecesBytes); i += 20 {
+			pieceHash := piecesBytes[i : i+20]
+			fmt.Printf("%x\n", pieceHash)
+		}
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
