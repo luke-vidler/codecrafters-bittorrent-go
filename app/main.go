@@ -287,6 +287,75 @@ func sendPeerMessage(conn net.Conn, messageID uint8, payload []byte) error {
 	return nil
 }
 
+// downloadPieceFromConnection downloads a single piece from an already-established peer connection
+// The connection should already have completed handshake, received bitfield, sent interested, and received unchoke
+func downloadPieceFromConnection(conn net.Conn, pieceIndex int, pieceLength int, expectedPieceHash []byte) ([]byte, error) {
+	blockSize := 16 * 1024 // 16 KiB
+	numBlocks := (pieceLength + blockSize - 1) / blockSize // ceiling division
+	pieceData := make([]byte, pieceLength)
+	blocksReceived := make(map[int][]byte) // map of begin offset to block data
+
+	// Send request messages for all blocks
+	for i := 0; i < numBlocks; i++ {
+		begin := i * blockSize
+		blockLength := blockSize
+		if begin+blockLength > pieceLength {
+			blockLength = pieceLength - begin
+		}
+
+		// Build request message payload: index (4 bytes) + begin (4 bytes) + length (4 bytes)
+		payload := make([]byte, 12)
+		binary.BigEndian.PutUint32(payload[0:4], uint32(pieceIndex))
+		binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
+		binary.BigEndian.PutUint32(payload[8:12], uint32(blockLength))
+
+		err := sendPeerMessage(conn, 6, payload) // request message id is 6
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Receive piece messages
+	piecesReceived := 0
+	for piecesReceived < numBlocks {
+		msgID, payload, err := readPeerMessage(conn)
+		if err != nil {
+			return nil, err
+		}
+		if msgID == 0 {
+			// Keep-alive message, ignore
+			continue
+		}
+		if msgID == 7 { // piece message
+			if len(payload) < 8 {
+				return nil, fmt.Errorf("piece message too short")
+			}
+			// Extract index, begin, and block data
+			receivedIndex := binary.BigEndian.Uint32(payload[0:4])
+			receivedBegin := binary.BigEndian.Uint32(payload[4:8])
+			blockData := payload[8:]
+
+			if int(receivedIndex) == pieceIndex {
+				blocksReceived[int(receivedBegin)] = blockData
+				piecesReceived++
+			}
+		}
+	}
+
+	// Combine blocks into piece
+	for begin, blockData := range blocksReceived {
+		copy(pieceData[begin:], blockData)
+	}
+
+	// Verify piece hash
+	pieceHash := sha1.Sum(pieceData)
+	if string(pieceHash[:]) != string(expectedPieceHash) {
+		return nil, fmt.Errorf("piece hash mismatch")
+	}
+
+	return pieceData, nil
+}
+
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
@@ -1029,6 +1098,301 @@ func main() {
 		}
 
 		fmt.Printf("Piece %d downloaded to %s.\n", pieceIndex, outputFile)
+	} else if command == "download" {
+		// Parse arguments: download -o output_file torrent_file
+		if len(os.Args) < 5 || os.Args[2] != "-o" {
+			fmt.Println("Usage: download -o <output-file> <torrent-file>")
+			os.Exit(1)
+		}
+		outputFile := os.Args[3]
+		filename := os.Args[4]
+
+		// Read the torrent file
+		fileData, err := os.ReadFile(filename)
+		if err != nil {
+			fmt.Printf("Error reading file: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Decode the torrent file
+		bencodedString := string(fileData)
+		decoded, err := decodeBencode(bencodedString)
+		if err != nil {
+			fmt.Printf("Error decoding bencode: %v\n", err)
+			os.Exit(1)
+		}
+
+		torrentDict, ok := decoded.(map[string]interface{})
+		if !ok {
+			fmt.Println("Error: torrent file does not contain a dictionary")
+			os.Exit(1)
+		}
+
+		// Extract info dictionary
+		info, ok := torrentDict["info"]
+		if !ok {
+			fmt.Println("Error: torrent file missing 'info' field")
+			os.Exit(1)
+		}
+		infoDict, ok := info.(map[string]interface{})
+		if !ok {
+			fmt.Println("Error: 'info' field is not a dictionary")
+			os.Exit(1)
+		}
+
+		// Extract piece length
+		pieceLength, ok := infoDict["piece length"]
+		if !ok {
+			fmt.Println("Error: 'info' dictionary missing 'piece length' field")
+			os.Exit(1)
+		}
+		pieceLengthInt, ok := pieceLength.(int)
+		if !ok {
+			fmt.Println("Error: 'piece length' field is not an integer")
+			os.Exit(1)
+		}
+
+		// Extract pieces hashes
+		pieces, ok := infoDict["pieces"]
+		if !ok {
+			fmt.Println("Error: 'info' dictionary missing 'pieces' field")
+			os.Exit(1)
+		}
+		piecesStr, ok := pieces.(string)
+		if !ok {
+			fmt.Println("Error: 'pieces' field is not a string")
+			os.Exit(1)
+		}
+		piecesBytes := []byte(piecesStr)
+		numPieces := len(piecesBytes) / 20
+
+		// Extract length to calculate last piece size
+		length, ok := infoDict["length"]
+		if !ok {
+			fmt.Println("Error: 'info' dictionary missing 'length' field")
+			os.Exit(1)
+		}
+		lengthInt, ok := length.(int)
+		if !ok {
+			fmt.Println("Error: 'length' field is not an integer")
+			os.Exit(1)
+		}
+
+		// Get peers from tracker
+		announce, ok := torrentDict["announce"]
+		if !ok {
+			fmt.Println("Error: torrent file missing 'announce' field")
+			os.Exit(1)
+		}
+		announceStr, ok := announce.(string)
+		if !ok {
+			fmt.Println("Error: 'announce' field is not a string")
+			os.Exit(1)
+		}
+
+		// Extract info hash
+		infoBytes, err := findInfoDictionaryBytes(fileData)
+		if err != nil {
+			fmt.Printf("Error extracting info dictionary: %v\n", err)
+			os.Exit(1)
+		}
+		hash := sha1.Sum(infoBytes)
+		infoHashBytes := hash[:]
+
+		// Get peers (reuse logic from peers command)
+		peerID := "01234567890123456789" // 20 bytes
+		baseURL, err := url.Parse(announceStr)
+		if err != nil {
+			fmt.Printf("Error parsing tracker URL: %v\n", err)
+			os.Exit(1)
+		}
+		query := baseURL.Query()
+		query.Set("info_hash", string(infoHashBytes))
+		query.Set("peer_id", peerID)
+		query.Set("port", "6881")
+		query.Set("uploaded", "0")
+		query.Set("downloaded", "0")
+		query.Set("left", strconv.Itoa(lengthInt))
+		query.Set("compact", "1")
+		baseURL.RawQuery = query.Encode()
+		trackerURL := baseURL.String()
+
+		resp, err := http.Get(trackerURL)
+		if err != nil {
+			fmt.Printf("Error making HTTP request: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("Error: tracker returned status code %d\n", resp.StatusCode)
+			os.Exit(1)
+		}
+
+		bodyBytes := make([]byte, 0)
+		buf := make([]byte, 4096)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				bodyBytes = append(bodyBytes, buf[:n]...)
+			}
+			if err != nil {
+				break
+			}
+		}
+
+		responseString := string(bodyBytes)
+		trackerResponse, err := decodeBencode(responseString)
+		if err != nil {
+			fmt.Printf("Error decoding tracker response: %v\n", err)
+			os.Exit(1)
+		}
+
+		trackerDict, ok := trackerResponse.(map[string]interface{})
+		if !ok {
+			fmt.Println("Error: tracker response is not a dictionary")
+			os.Exit(1)
+		}
+
+		if failureReason, ok := trackerDict["failure reason"]; ok {
+			failureStr, ok := failureReason.(string)
+			if ok {
+				fmt.Printf("Tracker error: %s\n", failureStr)
+			} else {
+				fmt.Println("Tracker returned an error")
+			}
+			os.Exit(1)
+		}
+
+		peers, ok := trackerDict["peers"]
+		if !ok {
+			fmt.Println("Error: tracker response missing 'peers' field")
+			os.Exit(1)
+		}
+		peersStr, ok := peers.(string)
+		if !ok {
+			fmt.Println("Error: 'peers' field is not a string")
+			os.Exit(1)
+		}
+
+		peersBytes := []byte(peersStr)
+		if len(peersBytes) < 6 {
+			fmt.Println("Error: no peers available")
+			os.Exit(1)
+		}
+
+		// Connect to first peer
+		peerBytes := peersBytes[0:6]
+		peerIP := fmt.Sprintf("%d.%d.%d.%d", peerBytes[0], peerBytes[1], peerBytes[2], peerBytes[3])
+		peerPort := binary.BigEndian.Uint16(peerBytes[4:6])
+
+		// Generate random peer_id for handshake
+		handshakePeerID := make([]byte, 20)
+		_, err = rand.Read(handshakePeerID)
+		if err != nil {
+			fmt.Printf("Error generating peer ID: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Perform handshake
+		conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", peerIP, peerPort))
+		if err != nil {
+			fmt.Printf("Error connecting to peer: %v\n", err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+
+		handshake := make([]byte, 0, 68)
+		handshake = append(handshake, 19)
+		handshake = append(handshake, []byte("BitTorrent protocol")...)
+		handshake = append(handshake, make([]byte, 8)...)
+		handshake = append(handshake, infoHashBytes...)
+		handshake = append(handshake, handshakePeerID...)
+
+		_, err = conn.Write(handshake)
+		if err != nil {
+			fmt.Printf("Error sending handshake: %v\n", err)
+			os.Exit(1)
+		}
+
+		response := make([]byte, 68)
+		totalRead := 0
+		for totalRead < 68 {
+			n, err := conn.Read(response[totalRead:])
+			if err != nil {
+				fmt.Printf("Error receiving handshake: %v\n", err)
+				os.Exit(1)
+			}
+			totalRead += n
+		}
+
+		// Wait for bitfield message (id 5)
+		for {
+			msgID, _, err := readPeerMessage(conn)
+			if err != nil {
+				fmt.Printf("Error reading message: %v\n", err)
+				os.Exit(1)
+			}
+			if msgID == 5 { // bitfield
+				break
+			}
+			// Ignore keep-alive (msgID == 0) and other messages
+		}
+
+		// Send interested message (id 2)
+		err = sendPeerMessage(conn, 2, nil)
+		if err != nil {
+			fmt.Printf("Error sending interested: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Wait for unchoke message (id 1)
+		for {
+			msgID, _, err := readPeerMessage(conn)
+			if err != nil {
+				fmt.Printf("Error reading message: %v\n", err)
+				os.Exit(1)
+			}
+			if msgID == 1 { // unchoke
+				break
+			}
+			// Ignore keep-alive (msgID == 0) and other messages
+		}
+
+		// Download all pieces
+		allPieces := make([][]byte, numPieces)
+		for i := 0; i < numPieces; i++ {
+			// Calculate actual piece length (last piece might be smaller)
+			actualPieceLength := pieceLengthInt
+			if i == numPieces-1 {
+				actualPieceLength = lengthInt - (i * pieceLengthInt)
+			}
+
+			expectedPieceHash := piecesBytes[i*20 : (i+1)*20]
+
+			pieceData, err := downloadPieceFromConnection(conn, i, actualPieceLength, expectedPieceHash)
+			if err != nil {
+				fmt.Printf("Error downloading piece %d: %v\n", i, err)
+				os.Exit(1)
+			}
+
+			allPieces[i] = pieceData
+		}
+
+		// Combine all pieces into the final file
+		fileData2 := make([]byte, 0, lengthInt)
+		for _, piece := range allPieces {
+			fileData2 = append(fileData2, piece...)
+		}
+
+		// Write to file
+		err = os.WriteFile(outputFile, fileData2, 0644)
+		if err != nil {
+			fmt.Printf("Error writing file: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Downloaded %s to %s.\n", filename, outputFile)
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
