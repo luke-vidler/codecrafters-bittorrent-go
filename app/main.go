@@ -287,6 +287,281 @@ func sendPeerMessage(conn net.Conn, messageID uint8, payload []byte) error {
 	return nil
 }
 
+// TorrentFile holds parsed torrent file data
+type TorrentFile struct {
+	Announce    string
+	InfoDict    map[string]interface{}
+	InfoBytes   []byte
+	InfoHash    []byte
+	Length      int
+	PieceLength int
+	Pieces      []byte
+	NumPieces   int
+}
+
+// parseTorrentFile reads and parses a torrent file
+func parseTorrentFile(filename string) (*TorrentFile, error) {
+	fileData, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("error reading file: %w", err)
+	}
+
+	bencodedString := string(fileData)
+	decoded, err := decodeBencode(bencodedString)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding bencode: %w", err)
+	}
+
+	torrentDict, ok := decoded.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("torrent file does not contain a dictionary")
+	}
+
+	// Extract announce
+	announce, ok := torrentDict["announce"]
+	if !ok {
+		return nil, fmt.Errorf("torrent file missing 'announce' field")
+	}
+	announceStr, ok := announce.(string)
+	if !ok {
+		return nil, fmt.Errorf("'announce' field is not a string")
+	}
+
+	// Extract info dictionary
+	info, ok := torrentDict["info"]
+	if !ok {
+		return nil, fmt.Errorf("torrent file missing 'info' field")
+	}
+	infoDict, ok := info.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("'info' field is not a dictionary")
+	}
+
+	// Extract length
+	length, ok := infoDict["length"]
+	if !ok {
+		return nil, fmt.Errorf("'info' dictionary missing 'length' field")
+	}
+	lengthInt, ok := length.(int)
+	if !ok {
+		return nil, fmt.Errorf("'length' field is not an integer")
+	}
+
+	// Extract piece length
+	pieceLength, ok := infoDict["piece length"]
+	if !ok {
+		return nil, fmt.Errorf("'info' dictionary missing 'piece length' field")
+	}
+	pieceLengthInt, ok := pieceLength.(int)
+	if !ok {
+		return nil, fmt.Errorf("'piece length' field is not an integer")
+	}
+
+	// Extract pieces
+	pieces, ok := infoDict["pieces"]
+	if !ok {
+		return nil, fmt.Errorf("'info' dictionary missing 'pieces' field")
+	}
+	piecesStr, ok := pieces.(string)
+	if !ok {
+		return nil, fmt.Errorf("'pieces' field is not a string")
+	}
+	piecesBytes := []byte(piecesStr)
+	if len(piecesBytes)%20 != 0 {
+		return nil, fmt.Errorf("'pieces' length (%d) is not a multiple of 20", len(piecesBytes))
+	}
+
+	// Extract info hash
+	infoBytes, err := findInfoDictionaryBytes(fileData)
+	if err != nil {
+		return nil, fmt.Errorf("error extracting info dictionary: %w", err)
+	}
+	hash := sha1.Sum(infoBytes)
+	infoHash := hash[:]
+
+	return &TorrentFile{
+		Announce:    announceStr,
+		InfoDict:    infoDict,
+		InfoBytes:   infoBytes,
+		InfoHash:    infoHash,
+		Length:      lengthInt,
+		PieceLength: pieceLengthInt,
+		Pieces:      piecesBytes,
+		NumPieces:   len(piecesBytes) / 20,
+	}, nil
+}
+
+// Peer represents a peer address
+type Peer struct {
+	IP   string
+	Port uint16
+}
+
+// getPeersFromTracker fetches peers from the tracker
+func getPeersFromTracker(torrent *TorrentFile) ([]Peer, error) {
+	peerID := "01234567890123456789" // 20 bytes
+
+	baseURL, err := url.Parse(torrent.Announce)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing tracker URL: %w", err)
+	}
+
+	query := baseURL.Query()
+	query.Set("info_hash", string(torrent.InfoHash))
+	query.Set("peer_id", peerID)
+	query.Set("port", "6881")
+	query.Set("uploaded", "0")
+	query.Set("downloaded", "0")
+	query.Set("left", strconv.Itoa(torrent.Length))
+	query.Set("compact", "1")
+	baseURL.RawQuery = query.Encode()
+	trackerURL := baseURL.String()
+
+	resp, err := http.Get(trackerURL)
+	if err != nil {
+		return nil, fmt.Errorf("error making HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("tracker returned status code %d", resp.StatusCode)
+	}
+
+	bodyBytes := make([]byte, 0)
+	buf := make([]byte, 4096)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			bodyBytes = append(bodyBytes, buf[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	responseString := string(bodyBytes)
+	trackerResponse, err := decodeBencode(responseString)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding tracker response: %w", err)
+	}
+
+	trackerDict, ok := trackerResponse.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("tracker response is not a dictionary")
+	}
+
+	if failureReason, ok := trackerDict["failure reason"]; ok {
+		failureStr, ok := failureReason.(string)
+		if ok {
+			return nil, fmt.Errorf("tracker error: %s", failureStr)
+		}
+		return nil, fmt.Errorf("tracker returned an error")
+	}
+
+	peers, ok := trackerDict["peers"]
+	if !ok {
+		return nil, fmt.Errorf("tracker response missing 'peers' field")
+	}
+	peersStr, ok := peers.(string)
+	if !ok {
+		return nil, fmt.Errorf("'peers' field is not a string")
+	}
+
+	peersBytes := []byte(peersStr)
+	if len(peersBytes)%6 != 0 {
+		return nil, fmt.Errorf("'peers' length (%d) is not a multiple of 6", len(peersBytes))
+	}
+
+	var peerList []Peer
+	for i := 0; i < len(peersBytes); i += 6 {
+		peerBytes := peersBytes[i : i+6]
+		ip := fmt.Sprintf("%d.%d.%d.%d", peerBytes[0], peerBytes[1], peerBytes[2], peerBytes[3])
+		port := binary.BigEndian.Uint16(peerBytes[4:6])
+		peerList = append(peerList, Peer{IP: ip, Port: port})
+	}
+
+	return peerList, nil
+}
+
+// establishPeerConnection performs handshake and sets up peer connection
+func establishPeerConnection(peer Peer, infoHash []byte) (net.Conn, error) {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", peer.IP, peer.Port))
+	if err != nil {
+		return nil, fmt.Errorf("error connecting to peer: %w", err)
+	}
+
+	// Generate random peer_id for handshake
+	handshakePeerID := make([]byte, 20)
+	_, err = rand.Read(handshakePeerID)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("error generating peer ID: %w", err)
+	}
+
+	// Build handshake message
+	handshake := make([]byte, 0, 68)
+	handshake = append(handshake, 19)
+	handshake = append(handshake, []byte("BitTorrent protocol")...)
+	handshake = append(handshake, make([]byte, 8)...)
+	handshake = append(handshake, infoHash...)
+	handshake = append(handshake, handshakePeerID...)
+
+	_, err = conn.Write(handshake)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("error sending handshake: %w", err)
+	}
+
+	// Receive handshake response
+	response := make([]byte, 68)
+	totalRead := 0
+	for totalRead < 68 {
+		n, err := conn.Read(response[totalRead:])
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("error receiving handshake: %w", err)
+		}
+		totalRead += n
+	}
+
+	return conn, nil
+}
+
+// setupPeerForDownload completes the peer protocol setup (bitfield, interested, unchoke)
+func setupPeerForDownload(conn net.Conn) error {
+	// Wait for bitfield message (id 5)
+	for {
+		msgID, _, err := readPeerMessage(conn)
+		if err != nil {
+			return fmt.Errorf("error reading message: %w", err)
+		}
+		if msgID == 5 { // bitfield
+			break
+		}
+		// Ignore keep-alive (msgID == 0) and other messages
+	}
+
+	// Send interested message (id 2)
+	err := sendPeerMessage(conn, 2, nil)
+	if err != nil {
+		return fmt.Errorf("error sending interested: %w", err)
+	}
+
+	// Wait for unchoke message (id 1)
+	for {
+		msgID, _, err := readPeerMessage(conn)
+		if err != nil {
+			return fmt.Errorf("error reading message: %w", err)
+		}
+		if msgID == 1 { // unchoke
+			break
+		}
+		// Ignore keep-alive (msgID == 0) and other messages
+	}
+
+	return nil
+}
+
 // downloadPieceFromConnection downloads a single piece from an already-established peer connection
 // The connection should already have completed handshake, received bitfield, sent interested, and received unchoke
 func downloadPieceFromConnection(conn net.Conn, pieceIndex int, pieceLength int, expectedPieceHash []byte) ([]byte, error) {
@@ -377,293 +652,41 @@ func main() {
 	} else if command == "info" {
 		filename := os.Args[2]
 
-		// Read the torrent file as bytes (it may contain binary data)
-		fileData, err := os.ReadFile(filename)
+		torrent, err := parseTorrentFile(filename)
 		if err != nil {
-			fmt.Printf("Error reading file: %v\n", err)
+			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Convert bytes to string (Go strings can contain arbitrary bytes)
-		bencodedString := string(fileData)
-
-		// Decode the bencoded dictionary
-		decoded, err := decodeBencode(bencodedString)
-		if err != nil {
-			fmt.Printf("Error decoding bencode: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Cast to map[string]interface{}
-		torrentDict, ok := decoded.(map[string]interface{})
-		if !ok {
-			fmt.Println("Error: torrent file does not contain a dictionary")
-			os.Exit(1)
-		}
-
-		// Extract announce (tracker URL)
-		announce, ok := torrentDict["announce"]
-		if !ok {
-			fmt.Println("Error: torrent file missing 'announce' field")
-			os.Exit(1)
-		}
-		announceStr, ok := announce.(string)
-		if !ok {
-			fmt.Println("Error: 'announce' field is not a string")
-			os.Exit(1)
-		}
-
-		// Extract info dictionary
-		info, ok := torrentDict["info"]
-		if !ok {
-			fmt.Println("Error: torrent file missing 'info' field")
-			os.Exit(1)
-		}
-		infoDict, ok := info.(map[string]interface{})
-		if !ok {
-			fmt.Println("Error: 'info' field is not a dictionary")
-			os.Exit(1)
-		}
-
-		// Extract length from info
-		length, ok := infoDict["length"]
-		if !ok {
-			fmt.Println("Error: 'info' dictionary missing 'length' field")
-			os.Exit(1)
-		}
-		lengthInt, ok := length.(int)
-		if !ok {
-			fmt.Println("Error: 'length' field is not an integer")
-			os.Exit(1)
-		}
-
-		// Extract the info dictionary bytes for hashing
-		infoBytes, err := findInfoDictionaryBytes(fileData)
-		if err != nil {
-			fmt.Printf("Error extracting info dictionary: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Calculate SHA-1 hash
-		hash := sha1.Sum(infoBytes)
-		infoHash := fmt.Sprintf("%x", hash)
-
-		// Extract piece length from info
-		pieceLength, ok := infoDict["piece length"]
-		if !ok {
-			fmt.Println("Error: 'info' dictionary missing 'piece length' field")
-			os.Exit(1)
-		}
-		pieceLengthInt, ok := pieceLength.(int)
-		if !ok {
-			fmt.Println("Error: 'piece length' field is not an integer")
-			os.Exit(1)
-		}
-
-		// Extract pieces from info
-		pieces, ok := infoDict["pieces"]
-		if !ok {
-			fmt.Println("Error: 'info' dictionary missing 'pieces' field")
-			os.Exit(1)
-		}
-		piecesStr, ok := pieces.(string)
-		if !ok {
-			fmt.Println("Error: 'pieces' field is not a string")
-			os.Exit(1)
-		}
-
-		// Convert pieces string to bytes and split into 20-byte chunks
-		piecesBytes := []byte(piecesStr)
-		if len(piecesBytes)%20 != 0 {
-			fmt.Printf("Error: 'pieces' length (%d) is not a multiple of 20\n", len(piecesBytes))
-			os.Exit(1)
-		}
+		infoHash := fmt.Sprintf("%x", torrent.InfoHash)
 
 		// Print the information
-		fmt.Printf("Tracker URL: %s\n", announceStr)
-		fmt.Printf("Length: %d\n", lengthInt)
+		fmt.Printf("Tracker URL: %s\n", torrent.Announce)
+		fmt.Printf("Length: %d\n", torrent.Length)
 		fmt.Printf("Info Hash: %s\n", infoHash)
-		fmt.Printf("Piece Length: %d\n", pieceLengthInt)
+		fmt.Printf("Piece Length: %d\n", torrent.PieceLength)
 		fmt.Println("Piece Hashes:")
-		for i := 0; i < len(piecesBytes); i += 20 {
-			pieceHash := piecesBytes[i : i+20]
+		for i := 0; i < len(torrent.Pieces); i += 20 {
+			pieceHash := torrent.Pieces[i : i+20]
 			fmt.Printf("%x\n", pieceHash)
 		}
 	} else if command == "peers" {
 		filename := os.Args[2]
 
-		// Read the torrent file as bytes
-		fileData, err := os.ReadFile(filename)
+		torrent, err := parseTorrentFile(filename)
 		if err != nil {
-			fmt.Printf("Error reading file: %v\n", err)
+			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Convert bytes to string
-		bencodedString := string(fileData)
-
-		// Decode the bencoded dictionary
-		decoded, err := decodeBencode(bencodedString)
+		peers, err := getPeersFromTracker(torrent)
 		if err != nil {
-			fmt.Printf("Error decoding bencode: %v\n", err)
+			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Cast to map[string]interface{}
-		torrentDict, ok := decoded.(map[string]interface{})
-		if !ok {
-			fmt.Println("Error: torrent file does not contain a dictionary")
-			os.Exit(1)
-		}
-
-		// Extract announce (tracker URL)
-		announce, ok := torrentDict["announce"]
-		if !ok {
-			fmt.Println("Error: torrent file missing 'announce' field")
-			os.Exit(1)
-		}
-		announceStr, ok := announce.(string)
-		if !ok {
-			fmt.Println("Error: 'announce' field is not a string")
-			os.Exit(1)
-		}
-
-		// Extract info dictionary
-		info, ok := torrentDict["info"]
-		if !ok {
-			fmt.Println("Error: torrent file missing 'info' field")
-			os.Exit(1)
-		}
-		infoDict, ok := info.(map[string]interface{})
-		if !ok {
-			fmt.Println("Error: 'info' field is not a dictionary")
-			os.Exit(1)
-		}
-
-		// Extract length from info
-		length, ok := infoDict["length"]
-		if !ok {
-			fmt.Println("Error: 'info' dictionary missing 'length' field")
-			os.Exit(1)
-		}
-		lengthInt, ok := length.(int)
-		if !ok {
-			fmt.Println("Error: 'length' field is not an integer")
-			os.Exit(1)
-		}
-
-		// Extract the info dictionary bytes for hashing
-		infoBytes, err := findInfoDictionaryBytes(fileData)
-		if err != nil {
-			fmt.Printf("Error extracting info dictionary: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Calculate SHA-1 hash (20 bytes)
-		hash := sha1.Sum(infoBytes)
-		infoHashBytes := hash[:]
-
-		// Generate peer_id (20 bytes) - use a simple 20-character string
-		peerID := "01234567890123456789" // 20 bytes
-
-		// Build query parameters
-		baseURL, err := url.Parse(announceStr)
-		if err != nil {
-			fmt.Printf("Error parsing tracker URL: %v\n", err)
-			os.Exit(1)
-		}
-
-		query := baseURL.Query()
-		query.Set("info_hash", string(infoHashBytes))
-		query.Set("peer_id", peerID)
-		query.Set("port", "6881")
-		query.Set("uploaded", "0")
-		query.Set("downloaded", "0")
-		query.Set("left", strconv.Itoa(lengthInt))
-		query.Set("compact", "1")
-
-		baseURL.RawQuery = query.Encode()
-		trackerURL := baseURL.String()
-
-		// Make HTTP GET request
-		resp, err := http.Get(trackerURL)
-		if err != nil {
-			fmt.Printf("Error making HTTP request: %v\n", err)
-			os.Exit(1)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("Error: tracker returned status code %d\n", resp.StatusCode)
-			os.Exit(1)
-		}
-
-		// Read response body
-		bodyBytes := make([]byte, 0)
-		buf := make([]byte, 4096)
-		for {
-			n, err := resp.Body.Read(buf)
-			if n > 0 {
-				bodyBytes = append(bodyBytes, buf[:n]...)
-			}
-			if err != nil {
-				break
-			}
-		}
-
-		// Decode the bencoded response
-		responseString := string(bodyBytes)
-		trackerResponse, err := decodeBencode(responseString)
-		if err != nil {
-			fmt.Printf("Error decoding tracker response: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Cast to map[string]interface{}
-		trackerDict, ok := trackerResponse.(map[string]interface{})
-		if !ok {
-			fmt.Println("Error: tracker response is not a dictionary")
-			os.Exit(1)
-		}
-
-		// Check for tracker errors
-		if failureReason, ok := trackerDict["failure reason"]; ok {
-			failureStr, ok := failureReason.(string)
-			if ok {
-				fmt.Printf("Tracker error: %s\n", failureStr)
-			} else {
-				fmt.Println("Tracker returned an error (failure reason is not a string)")
-			}
-			os.Exit(1)
-		}
-
-		// Extract peers
-		peers, ok := trackerDict["peers"]
-		if !ok {
-			fmt.Println("Error: tracker response missing 'peers' field")
-			os.Exit(1)
-		}
-		peersStr, ok := peers.(string)
-		if !ok {
-			fmt.Println("Error: 'peers' field is not a string")
-			os.Exit(1)
-		}
-
-		// Parse compact peer representation (6 bytes per peer: 4 bytes IP, 2 bytes port)
-		peersBytes := []byte(peersStr)
-		if len(peersBytes)%6 != 0 {
-			fmt.Printf("Error: 'peers' length (%d) is not a multiple of 6\n", len(peersBytes))
-			os.Exit(1)
-		}
-
-		// Parse and print each peer
-		for i := 0; i < len(peersBytes); i += 6 {
-			peerBytes := peersBytes[i : i+6]
-			// First 4 bytes are IP address (IPv4)
-			ip := fmt.Sprintf("%d.%d.%d.%d", peerBytes[0], peerBytes[1], peerBytes[2], peerBytes[3])
-			// Last 2 bytes are port (big-endian)
-			port := binary.BigEndian.Uint16(peerBytes[4:6])
-			fmt.Printf("%s:%d\n", ip, port)
+		for _, peer := range peers {
+			fmt.Printf("%s:%d\n", peer.IP, peer.Port)
 		}
 	} else if command == "handshake" {
 		filename := os.Args[2]
@@ -1393,6 +1416,68 @@ func main() {
 		}
 
 		fmt.Printf("Downloaded %s to %s.\n", filename, outputFile)
+	} else if command == "magnet_parse" {
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: magnet_parse <magnet-link>")
+			os.Exit(1)
+		}
+		magnetLink := os.Args[2]
+
+		// Parse the magnet link
+		// Format: magnet:?xt=urn:btih:<info_hash>&dn=<display_name>&tr=<tracker_url>
+		if !strings.HasPrefix(magnetLink, "magnet:?") {
+			fmt.Printf("Error: invalid magnet link format\n")
+			os.Exit(1)
+		}
+
+		// Remove "magnet:?" prefix
+		queryString := magnetLink[8:]
+		values, err := url.ParseQuery(queryString)
+		if err != nil {
+			fmt.Printf("Error: failed to parse magnet link: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Extract info hash from xt parameter
+		xt := values.Get("xt")
+		if xt == "" {
+			fmt.Printf("Error: missing 'xt' parameter\n")
+			os.Exit(1)
+		}
+		if !strings.HasPrefix(xt, "urn:btih:") {
+			fmt.Printf("Error: invalid 'xt' parameter format\n")
+			os.Exit(1)
+		}
+		infoHash := xt[9:] // Remove "urn:btih:" prefix
+
+		// Extract display name (URL decoded)
+		displayName := values.Get("dn")
+		if displayName == "" {
+			fmt.Printf("Error: missing 'dn' parameter\n")
+			os.Exit(1)
+		}
+		decodedDisplayName, err := url.QueryUnescape(displayName)
+		if err != nil {
+			fmt.Printf("Error: failed to decode display name: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Extract tracker URL (URL decoded)
+		trackerURL := values.Get("tr")
+		if trackerURL == "" {
+			fmt.Printf("Error: missing 'tr' parameter\n")
+			os.Exit(1)
+		}
+		decodedTrackerURL, err := url.QueryUnescape(trackerURL)
+		if err != nil {
+			fmt.Printf("Error: failed to decode tracker URL: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Print the parsed information
+		fmt.Printf("Info Hash: %s\n", infoHash)
+		fmt.Printf("Display Name: %s\n", decodedDisplayName)
+		fmt.Printf("Tracker URL: %s\n", decodedTrackerURL)
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
